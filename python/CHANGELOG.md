@@ -15,6 +15,11 @@ Versions follow [Semantic Versioning](https://semver.org/).
   `cleanup()` for expired sandboxes) removed only the Pod, so with `block_network=True` every sandbox leaked
   its `deepagents-deny-all-<id>` NetworkPolicy. The policy is now deleted together with the Pod; a missing
   object (404) is ignored.
+- **agent-sandbox: a reconnected sandbox could not run commands** — `reconnect()` set the claim name but
+  never opened the route `SandboxClient.__enter__()` opens (the `kubectl port-forward` tunnel in tunnel mode,
+  gateway discovery in gateway mode), so every request failed with "Sandbox is not ready" and callers had to
+  provision a new sandbox. Reconnect now opens that route; a failure is logged and the backend is still
+  returned, so the first `execute()` reports it. The backend's `cleanup()` stops the tunnel as before.
 
 ---
 

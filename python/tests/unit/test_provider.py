@@ -348,3 +348,39 @@ class TestDeleteRawPodRemovesNetworkPolicy:
             provider._delete_raw_pod("abc123", "default")  # no exception
 
         core_v1.delete_namespaced_pod.assert_called_once()
+
+
+class TestReconnectOpensConnection:
+    """A reconnected agent-sandbox client needs the same route __enter__ would open."""
+
+    def _reconnect(self, client, **config_kwargs):
+        provider = KubernetesProvider(KubernetesProviderConfig(mode="agent-sandbox", template_name="t", **config_kwargs))
+        with patch("langchain_kubernetes.provider._build_agent_sandbox_client", return_value=client), \
+             patch("langchain_kubernetes._k8s_http.is_k8s_api_configured", return_value=False):
+            return provider.reconnect("sandbox-claim-abc")
+
+    def test_tunnel_mode_starts_port_forward(self):
+        client = MagicMock(base_url=None, gateway_name=None)
+        sandbox = self._reconnect(client)
+        client._start_and_wait_for_port_forward.assert_called_once()
+        assert client.claim_name == "sandbox-claim-abc"
+        assert sandbox.id == "sandbox-claim-abc"
+
+    def test_gateway_mode_discovers_gateway(self):
+        client = MagicMock(base_url=None, gateway_name="gw")
+        self._reconnect(client)
+        client._wait_for_gateway_ip.assert_called_once()
+        client._start_and_wait_for_port_forward.assert_not_called()
+
+    def test_direct_mode_uses_configured_url(self):
+        client = MagicMock(base_url="http://router:8080", gateway_name=None)
+        self._reconnect(client)
+        client._start_and_wait_for_port_forward.assert_not_called()
+        client._wait_for_gateway_ip.assert_not_called()
+
+    def test_connection_failure_still_returns_backend(self, caplog):
+        client = MagicMock(base_url=None, gateway_name=None)
+        client._start_and_wait_for_port_forward.side_effect = RuntimeError("kubectl not found")
+        sandbox = self._reconnect(client)
+        assert sandbox.id == "sandbox-claim-abc"
+        assert any("kubectl not found" in r.getMessage() for r in caplog.records)

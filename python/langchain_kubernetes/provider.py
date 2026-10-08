@@ -539,6 +539,7 @@ class KubernetesProvider(SandboxProvider):
         except AttributeError:
             pass  # SDK may not expose these as writable; handled by sandbox_name arg
 
+        _open_reconnected_connection(client, sandbox_id)
         return AgentSandboxBackend(client=client, sandbox_name=sandbox_id)
 
     def _reconnect_raw_backend(self, sandbox_id: str) -> KubernetesBackendProtocol:
@@ -847,6 +848,25 @@ def _import_sandbox_client():
             "agent-sandbox mode requires the 'k8s-agent-sandbox' package. "
             "Install with: pip install langchain-kubernetes[agent-sandbox]"
         ) from exc
+
+
+def _open_reconnected_connection(client: Any, sandbox_id: str) -> None:
+    """Open the route ``SandboxClient.__enter__`` would, without creating a claim.
+
+    Without it a reconnected client has no ``base_url`` in tunnel or gateway
+    mode and every request fails with "Sandbox is not ready". On failure the
+    backend is still returned; the first ``execute()`` then surfaces the error.
+    The client's ``__exit__`` (backend ``cleanup()``) stops a started tunnel.
+    """
+    try:
+        if getattr(client, "base_url", None):
+            return  # direct mode: the configured URL is used as-is
+        if getattr(client, "gateway_name", None):
+            client._wait_for_gateway_ip()
+        else:
+            client._start_and_wait_for_port_forward()
+    except Exception as exc:
+        logger.warning("Reconnected to %s but could not open a connection: %s", sandbox_id, exc)
 
 
 def _build_agent_sandbox_client(config: KubernetesProviderConfig):
