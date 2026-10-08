@@ -7,6 +7,17 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [Unreleased]
+
+### Fixed
+
+- **Raw mode: deleting a sandbox left its NetworkPolicy behind** — `KubernetesProvider.delete()` (also used by
+  `cleanup()` for expired sandboxes) removed only the Pod, so with `block_network=True` every sandbox leaked
+  its `deepagents-deny-all-<id>` NetworkPolicy. The policy is now deleted together with the Pod; a missing
+  object (404) is ignored.
+
+---
+
 ## [0.4.0] — 2026-04-01
 
 ### Changed

@@ -743,17 +743,26 @@ class KubernetesProvider(SandboxProvider):
             raise
 
     def _delete_raw_pod(self, sandbox_id: str, namespace: str) -> None:
-        """Delete a raw-mode Pod by sandbox ID."""
+        """Delete a raw-mode Pod and its deny-all NetworkPolicy by sandbox ID.
+
+        The policy is created alongside the Pod when ``block_network=True``;
+        deleting only the Pod left one orphaned policy behind per sandbox.
+        Missing objects (404) are ignored.
+        """
         try:
             from langchain_kubernetes.backends.raw import RawK8sBackend, _ApiException
 
-            core_v1, _ = RawK8sBackend.load_k8s_clients()
-            pod_name = f"deepagents-{sandbox_id}"
-            try:
-                core_v1.delete_namespaced_pod(name=pod_name, namespace=namespace)
-            except _ApiException as exc:
-                if exc.status != 404:
-                    raise
+            core_v1, networking_v1 = RawK8sBackend.load_k8s_clients()
+            deletions = (
+                (core_v1.delete_namespaced_pod, f"deepagents-{sandbox_id}"),
+                (networking_v1.delete_namespaced_network_policy, f"deepagents-deny-all-{sandbox_id}"),
+            )
+            for delete, name in deletions:
+                try:
+                    delete(name=name, namespace=namespace)
+                except _ApiException as exc:
+                    if exc.status != 404:
+                        raise
         except ImportError:
             pass
 

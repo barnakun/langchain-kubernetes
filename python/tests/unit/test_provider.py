@@ -316,3 +316,35 @@ class TestModeDispatch:
             provider.get_or_create()
 
         mock_create.assert_called_once()
+
+
+class TestDeleteRawPodRemovesNetworkPolicy:
+    """provider.delete() in raw mode must not leave the per-sandbox deny-all policy behind."""
+
+    def _clients(self):
+        core_v1, networking_v1 = MagicMock(), MagicMock()
+        return core_v1, networking_v1
+
+    def test_deletes_pod_and_its_network_policy(self):
+        provider = KubernetesProvider(_raw_config())
+        core_v1, networking_v1 = self._clients()
+        with patch("langchain_kubernetes.backends.raw.RawK8sBackend.load_k8s_clients",
+                   return_value=(core_v1, networking_v1)):
+            provider._delete_raw_pod("abc123", "default")
+
+        core_v1.delete_namespaced_pod.assert_called_once_with(name="deepagents-abc123", namespace="default")
+        networking_v1.delete_namespaced_network_policy.assert_called_once_with(
+            name="deepagents-deny-all-abc123", namespace="default"
+        )
+
+    def test_missing_network_policy_is_ignored(self):
+        from langchain_kubernetes.backends.raw import _ApiException
+
+        provider = KubernetesProvider(_raw_config())
+        core_v1, networking_v1 = self._clients()
+        networking_v1.delete_namespaced_network_policy.side_effect = _ApiException(status=404)
+        with patch("langchain_kubernetes.backends.raw.RawK8sBackend.load_k8s_clients",
+                   return_value=(core_v1, networking_v1)):
+            provider._delete_raw_pod("abc123", "default")  # no exception
+
+        core_v1.delete_namespaced_pod.assert_called_once()
