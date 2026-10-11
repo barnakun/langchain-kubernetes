@@ -7,6 +7,20 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [0.4.2] — 2026-10-11
+
+### Fixed
+
+- **Raw mode: every upload hung until the exec timeout** — `upload_files_tar` piped the archive into
+  `base64 -d | tar` but the exec stream never signals EOF on stdin, so the command waited for more input until
+  `default_exec_timeout` (30 minutes) and then failed. The command now reads exactly the payload
+  (`head -c <n> | base64 -d | tar …`) and ends on its own; a 200 KB upload takes 0.1 s.
+- **The upload and download fallbacks returned `None`** — after a backend error, `KubernetesSandbox` fell back
+  to deepagents' `BaseSandbox.upload_files` / `download_files`, which are abstract in deepagents 0.6 and
+  returned `None`, so callers iterating the result crashed. The fallbacks now transfer each file through
+  `execute` (base64, in 60 KB chunks for uploads) and return one response per file with deepagents' error
+  codes.
+
 ## [0.4.1] — 2026-10-08
 
 ### Fixed
