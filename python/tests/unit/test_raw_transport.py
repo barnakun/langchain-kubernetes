@@ -211,6 +211,18 @@ class TestUploadFilesTar:
         assert "tar" in " ".join(cmd)
 
     @patch("langchain_kubernetes.backends.raw_transport.stream")
+    def test_reads_exactly_the_payload_so_no_eof_is_needed(self, mock_stream):
+        """The exec stream cannot signal EOF on stdin: `base64 -d` must stop after the payload, not wait."""
+        resp = self._make_upload_resp()
+        mock_stream.return_value = resp
+
+        upload_files_tar(MagicMock(), "pod1", "default", "sandbox", [("/a.txt", b"data" * 100)], timeout=5)
+
+        payload = resp.write_stdin.call_args[0][0]
+        script = mock_stream.call_args[1]["command"][-1]
+        assert script.startswith(f"head -c {len(payload)} |")
+
+    @patch("langchain_kubernetes.backends.raw_transport.stream")
     def test_stdin_enabled(self, mock_stream):
         mock_stream.return_value = self._make_upload_resp()
 

@@ -156,21 +156,22 @@ def upload_files_tar(
 
     b64_data = base64.b64encode(buf.getvalue()).decode("ascii")
 
-    # Execute `base64 -d | tar xf - -C /` and pipe base64 data to stdin.
+    # Pipe the base64 data to `base64 -d | tar xf - -C /`. The exec stream cannot signal EOF on
+    # stdin, so `head -c` reads exactly the payload and ends the pipeline; without it the
+    # command waits for input until the timeout.
     resp = stream(
         core_v1.connect_get_namespaced_pod_exec,
         name=pod_name,
         namespace=namespace,
         container=container,
-        command=["/bin/sh", "-c", "base64 -d | tar xf - -C /"],
+        command=["/bin/sh", "-c", f"head -c {len(b64_data)} | base64 -d | tar xf - -C /"],
         stderr=True,
         stdin=True,
         stdout=True,
         _preload_content=False,
     )
 
-    # Write the base64-encoded archive to stdin, then close to signal EOF.
-    resp.write_stdin(b64_data + "\n")
+    resp.write_stdin(b64_data)
 
     stderr_parts: list[str] = []
     deadline = time.monotonic() + timeout

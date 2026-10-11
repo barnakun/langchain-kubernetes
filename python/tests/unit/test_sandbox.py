@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import base64
+
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -128,19 +130,57 @@ class TestKubernetesSandboxUploadFiles:
         assert result[0].path == "/tmp/a.txt"
         assert result[0].error is None
 
-    def test_upload_falls_back_on_backend_error(self):
+    def test_upload_falls_back_to_base64_via_execute(self):
+        """deepagents' BaseSandbox.upload_files is abstract: the fallback must do the work itself."""
         sb, backend = _make_sandbox()
         backend.upload_files.side_effect = RuntimeError("backend failed")
+        backend.execute.return_value = ExecuteResponse(output="", exit_code=0, truncated=False)
 
-        with patch(
-            "deepagents.backends.sandbox.BaseSandbox.upload_files",
-            return_value=[FileUploadResponse(path="/tmp/a.txt", error=None)],
-        ) as mock_fallback:
-            result = sb.upload_files([("/tmp/a.txt", b"data")])
+        result = sb.upload_files([("/tmp/dir/a.txt", b"data")])
 
-        backend.upload_files.assert_called_once()
-        mock_fallback.assert_called_once()
-        assert len(result) == 1
+        assert [(r.path, r.error) for r in result] == [("/tmp/dir/a.txt", None)]
+        script = " ".join(c.args[0] for c in backend.execute.call_args_list)
+        assert "mkdir -p /tmp/dir" in script and "base64 -d > /tmp/dir/a.txt" in script
+        assert base64.b64encode(b"data").decode() in script
+
+    def test_upload_fallback_writes_large_files_in_chunks(self):
+        sb, backend = _make_sandbox()
+        backend.upload_files.side_effect = RuntimeError("backend failed")
+        backend.execute.return_value = ExecuteResponse(output="", exit_code=0, truncated=False)
+
+        sb.upload_files([("/tmp/big.bin", b"x" * 200_000)])
+
+        writes = [c.args[0] for c in backend.execute.call_args_list if "base64 -d" in c.args[0]]
+        assert len(writes) > 1
+        assert all(len(w) < 100_000 for w in writes)
+        assert "> /tmp/big.bin" in writes[0] and all(">> /tmp/big.bin" in w for w in writes[1:])
+
+    def test_upload_fallback_reports_failures_per_file(self):
+        sb, backend = _make_sandbox()
+        backend.upload_files.side_effect = RuntimeError("backend failed")
+        backend.execute.side_effect = lambda cmd, **kw: ExecuteResponse(
+            output="Permission denied" if "/root/" in cmd else "", exit_code=1 if "/root/" in cmd else 0,
+            truncated=False,
+        )
+
+        result = sb.upload_files([("/root/x.txt", b"a"), ("/tmp/y.txt", b"b")])
+
+        assert [(r.path, r.error) for r in result] == [("/root/x.txt", "permission_denied"), ("/tmp/y.txt", None)]
+
+    def test_download_falls_back_to_base64_via_execute(self):
+        sb, backend = _make_sandbox()
+        backend.download_files.side_effect = RuntimeError("backend failed")
+        backend.execute.side_effect = lambda cmd, **kw: (
+            ExecuteResponse(output=base64.b64encode(b"hello").decode(), exit_code=0, truncated=False)
+            if "/tmp/a.txt" in cmd
+            else ExecuteResponse(output="No such file or directory", exit_code=1, truncated=False)
+        )
+
+        result = sb.download_files(["/tmp/a.txt", "/tmp/missing.txt"])
+
+        assert [(r.path, r.content, r.error) for r in result] == [
+            ("/tmp/a.txt", b"hello", None), ("/tmp/missing.txt", None, "file_not_found")
+        ]
 
     def test_upload_multiple_files(self):
         sb, backend = _make_sandbox()
@@ -161,6 +201,28 @@ class TestKubernetesSandboxUploadFiles:
 
 
 class TestKubernetesSandboxDownloadFiles:
+    def test_download_fallback_treats_undecodable_output_as_an_error(self):
+        """A pipe can hide a failed read (exit 0, error text on the output): never decode garbage."""
+        sb, backend = _make_sandbox()
+        backend.download_files.side_effect = RuntimeError("backend failed")
+        backend.execute.return_value = ExecuteResponse(
+            output="base64: /tmp/x: No such file or directory", exit_code=0, truncated=False
+        )
+
+        result = sb.download_files(["/tmp/x"])
+
+        assert (result[0].content, result[0].error) == (None, "file_not_found")
+
+    def test_download_fallback_checks_the_path_before_reading(self):
+        sb, backend = _make_sandbox()
+        backend.download_files.side_effect = RuntimeError("backend failed")
+        backend.execute.return_value = ExecuteResponse(output="aGk=", exit_code=0, truncated=False)
+
+        sb.download_files(["/tmp/a b.txt"])
+
+        script = backend.execute.call_args.args[0]
+        assert "[ ! -e '/tmp/a b.txt' ]" in script and "[ ! -r '/tmp/a b.txt' ]" in script
+
     def test_download_delegates_to_backend(self):
         sb, backend = _make_sandbox()
         backend.download_files.return_value = [
@@ -172,22 +234,6 @@ class TestKubernetesSandboxDownloadFiles:
         backend.download_files.assert_called_once_with(["/tmp/a.txt"])
         assert result[0].content == b"content"
         assert result[0].error is None
-
-    def test_download_falls_back_on_backend_error(self):
-        sb, backend = _make_sandbox()
-        backend.download_files.side_effect = RuntimeError("backend failed")
-
-        with patch(
-            "deepagents.backends.sandbox.BaseSandbox.download_files",
-            return_value=[
-                FileDownloadResponse(path="/tmp/a.txt", content=None, error="file_not_found")
-            ],
-        ) as mock_fallback:
-            result = sb.download_files(["/tmp/a.txt"])
-
-        backend.download_files.assert_called_once()
-        mock_fallback.assert_called_once()
-        assert len(result) == 1
 
     def test_download_multiple_files(self):
         sb, backend = _make_sandbox()
