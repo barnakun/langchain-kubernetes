@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import logging
 import ssl
+import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
@@ -58,12 +59,52 @@ def _make_headers(token: str | None, content_type: str = "application/json") -> 
     return headers
 
 
-def is_k8s_api_configured(api_url: str | None, token_override: str | None) -> bool:
-    """Return True if direct Kubernetes API access has been explicitly configured
-    or the process is running inside a cluster.
+def _in_cluster() -> bool:
+    """Whether Kubernetes mounted a service-account token into this process's pod."""
+    return Path(_IN_CLUSTER_TOKEN_PATH).exists()
 
-    When neither is true (e.g. a developer running the agent-sandbox provider
-    on a local machine against an externally-hosted sandbox-router) there is no
+
+def _kubeconfig() -> Any | None:
+    """The local kubeconfig resolved into a ``kubernetes.client.Configuration``, or ``None``.
+
+    A kubeconfig may authenticate with client certificates or an exec plugin (minikube, kind,
+    cloud CLIs), which a bare bearer-token request cannot reproduce. Only the stable
+    ``Configuration`` fields are used (host, CA, client certificate, token), not the generated API
+    client, whose call signature differs between ``kubernetes`` releases. ``None`` when the
+    package or a kubeconfig is missing.
+    """
+    try:
+        from kubernetes import client, config
+
+        configuration = client.Configuration()
+        config.load_kube_config(client_configuration=configuration)
+        return configuration
+    except Exception:
+        return None
+
+
+def _kubeconfig_transport(configuration: Any) -> tuple[str, ssl.SSLContext, str | None]:
+    """Host, TLS context (CA, client certificate) and bearer header value of a Configuration."""
+    ca = getattr(configuration, "ssl_ca_cert", None)
+    ctx = ssl.create_default_context(cafile=ca) if ca else ssl.create_default_context()
+    if not getattr(configuration, "verify_ssl", True):
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+    cert = getattr(configuration, "cert_file", None)
+    if cert:
+        ctx.load_cert_chain(cert, getattr(configuration, "key_file", None) or None)
+    auth = None
+    getter = getattr(configuration, "get_api_key_with_prefix", None)
+    if callable(getter):
+        auth = getter("authorization") or getter("BearerToken")
+    return str(getattr(configuration, "host", "") or ""), ctx, auth
+
+
+def is_k8s_api_configured(api_url: str | None, token_override: str | None) -> bool:
+    """Return True if Kubernetes API access is configured: an explicit URL or token, a
+    service-account token (in a cluster), or a usable kubeconfig (outside one).
+
+    When none applies (e.g. a developer reaching an externally hosted sandbox-router) there is no
     reason to attempt K8s API calls, and failures should not produce warnings.
 
     Args:
@@ -73,11 +114,51 @@ def is_k8s_api_configured(api_url: str | None, token_override: str | None) -> bo
     Returns:
         ``True`` if K8s API access is configured or expected to work.
     """
-    if api_url or token_override:
+    if api_url or token_override or _in_cluster():
         return True
-    # Detect in-cluster by the presence of the service account token that
-    # Kubernetes mounts automatically in every Pod.
-    return Path(_IN_CLUSTER_TOKEN_PATH).exists()
+    return _kubeconfig() is not None
+
+
+def _request(
+    method: str,
+    api_url: str | None,
+    token_override: str | None,
+    path: str,
+    *,
+    query: dict[str, str] | None = None,
+    body: dict[str, Any] | None = None,
+    content_type: str = "application/json",
+    timeout: int = 10,
+) -> dict[str, Any]:
+    """One Kubernetes API call over HTTPS.
+
+    Credentials: an explicit token, else the in-cluster service-account token, else the local
+    kubeconfig (client certificate or token; ``api_url``, if given, replaces its host).
+    """
+    base = (api_url or _IN_CLUSTER_API_URL).rstrip("/")
+    ctx = None
+    auth = None
+    if not token_override and not _in_cluster():
+        configuration = _kubeconfig()
+        if configuration is not None:
+            host, ctx, auth = _kubeconfig_transport(configuration)
+            base = (api_url or host).rstrip("/")
+    url = f"{base}{path}"
+    if query:
+        url += "?" + urllib.parse.urlencode(query)
+    headers = _make_headers(_read_token(token_override), content_type=content_type)
+    if auth:
+        headers["Authorization"] = auth if " " in auth else f"Bearer {auth}"
+    data_bytes = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(url, data=data_bytes, headers=headers, method=method)
+    try:
+        context = ctx or _build_ssl_context()
+        with urllib.request.urlopen(req, context=context, timeout=timeout) as resp:
+            raw = resp.read()
+            return json.loads(raw) if raw else {}
+    except urllib.error.HTTPError as exc:
+        logger.debug("k8s %s %s → %s", method, path, exc.code)
+        raise
 
 
 def k8s_get(
@@ -92,7 +173,7 @@ def k8s_get(
 
     Args:
         api_url: Base URL of the Kubernetes API server.
-        token_override: Explicit bearer token (or ``None`` for in-cluster auto-read).
+        token_override: Explicit bearer token (``None``: in-cluster token, else the kubeconfig).
         path: API path (e.g. ``"/apis/extensions.agents.x-k8s.io/v1alpha1/...``).
         label_selector: Optional label selector query string.
         timeout: HTTP timeout in seconds.
@@ -102,24 +183,9 @@ def k8s_get(
 
     Raises:
         urllib.error.HTTPError: On non-2xx responses.
-        RuntimeError: On other errors.
     """
-    base = (api_url or _IN_CLUSTER_API_URL).rstrip("/")
-    url = f"{base}{path}"
-    if label_selector:
-        url += "?" + urllib.parse.urlencode({"labelSelector": label_selector})
-
-    token = _read_token(token_override)
-    headers = _make_headers(token)
-    ctx = _build_ssl_context()
-
-    req = urllib.request.Request(url, headers=headers, method="GET")
-    try:
-        with urllib.request.urlopen(req, context=ctx, timeout=timeout) as resp:
-            return json.loads(resp.read())
-    except urllib.error.HTTPError as exc:
-        logger.debug("k8s GET %s → %s", path, exc.code)
-        raise
+    query = {"labelSelector": label_selector} if label_selector else None
+    return _request("GET", api_url, token_override, path, query=query, timeout=timeout)
 
 
 def k8s_patch(
@@ -130,7 +196,7 @@ def k8s_patch(
     *,
     timeout: int = 10,
 ) -> dict[str, Any]:
-    """Perform a strategic merge PATCH request against the Kubernetes API.
+    """Perform a merge PATCH request against the Kubernetes API.
 
     Args:
         api_url: Base URL of the Kubernetes API server.
@@ -145,18 +211,26 @@ def k8s_patch(
     Raises:
         urllib.error.HTTPError: On non-2xx responses.
     """
-    base = (api_url or _IN_CLUSTER_API_URL).rstrip("/")
-    url = f"{base}{path}"
+    return _request(
+        "PATCH", api_url, token_override, path, body=patch,
+        content_type="application/merge-patch+json", timeout=timeout,
+    )
 
-    token = _read_token(token_override)
-    headers = _make_headers(token, content_type="application/merge-patch+json")
-    ctx = _build_ssl_context()
 
-    body = json.dumps(patch).encode()
-    req = urllib.request.Request(url, data=body, headers=headers, method="PATCH")
+def k8s_delete(
+    api_url: str | None,
+    token_override: str | None,
+    path: str,
+    *,
+    timeout: int = 10,
+) -> None:
+    """Delete a Kubernetes object; a missing one (404) is not an error.
+
+    Raises:
+        urllib.error.HTTPError: On other non-2xx responses.
+    """
     try:
-        with urllib.request.urlopen(req, context=ctx, timeout=timeout) as resp:
-            return json.loads(resp.read())
+        _request("DELETE", api_url, token_override, path, timeout=timeout)
     except urllib.error.HTTPError as exc:
-        logger.debug("k8s PATCH %s → %s", path, exc.code)
-        raise
+        if exc.code != 404:
+            raise

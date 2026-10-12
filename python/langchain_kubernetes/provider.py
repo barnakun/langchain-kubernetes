@@ -713,35 +713,15 @@ class KubernetesProvider(SandboxProvider):
     # ------------------------------------------------------------------
 
     def _delete_agent_sandbox_claim(self, claim_name: str) -> None:
-        """Delete a SandboxClaim via the Kubernetes API."""
-        import urllib.error
-        import urllib.request
+        """Delete a SandboxClaim via the Kubernetes API (a missing claim is not an error)."""
+        from langchain_kubernetes._k8s_http import k8s_delete
 
-        from langchain_kubernetes._k8s_http import (
-            _IN_CLUSTER_API_URL,
-            _build_ssl_context,
-            _make_headers,
-            _read_token,
-        )
-
-        path = (
+        k8s_delete(
+            self._config.kube_api_url,
+            self._config.kube_token,
             f"/apis/{_CLAIM_API_GROUP}/{_CLAIM_API_VERSION}"
-            f"/namespaces/{self._config.namespace}/{_CLAIM_PLURAL}/{claim_name}"
+            f"/namespaces/{self._config.namespace}/{_CLAIM_PLURAL}/{claim_name}",
         )
-        base = (self._config.kube_api_url or _IN_CLUSTER_API_URL).rstrip("/")
-        url = f"{base}{path}"
-        token = _read_token(self._config.kube_token)
-        headers = _make_headers(token)
-        ctx = _build_ssl_context()
-
-        req = urllib.request.Request(url, headers=headers, method="DELETE")
-        try:
-            with urllib.request.urlopen(req, context=ctx, timeout=10):
-                pass
-        except urllib.error.HTTPError as exc:
-            if exc.code == 404:
-                return
-            raise
 
     def _delete_raw_pod(self, sandbox_id: str, namespace: str) -> None:
         """Delete a raw-mode Pod and its deny-all NetworkPolicy by sandbox ID.
