@@ -7,6 +7,16 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [0.4.3] — 2026-10-12
+
+### Fixed
+
+- **Agent-sandbox mode could not list or delete claims from outside a cluster** — the claim list, verification and
+  delete calls sent a bare HTTPS request with a bearer token read from the in-cluster service-account file. Outside
+  a cluster, with no `kube_token`, they went out unauthenticated and got `403 Forbidden`, so every sandbox was left
+  running and TTL cleanup failed. Without a token or a service account they now use the local kubeconfig's
+  credentials (client certificate, CA and token; `kube_api_url`, if set, replaces its host).
+
 ## [0.4.2] — 2026-10-11
 
 ### Fixed
